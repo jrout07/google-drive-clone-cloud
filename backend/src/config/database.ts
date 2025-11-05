@@ -5,6 +5,30 @@ import { logger } from '../utils/logger';
 // Database connection pool
 let pool: Pool;
 
+// SSL Configuration function
+const getSSLConfig = () => {
+  if (!config.database.ssl) {
+    return false;
+  }
+
+  if (config.nodeEnv === 'production') {
+    // Production: Use proper SSL verification for AWS RDS
+    return {
+      rejectUnauthorized: true,
+      // AWS RDS provides valid SSL certificates
+      // No need to specify CA as it uses standard certificates
+    };
+  } else {
+    // Development: Allow self-signed certificates for local testing
+    // But still require SSL connection
+    return {
+      rejectUnauthorized: false,
+      // This allows connection to AWS RDS in development
+      // while still encrypting the connection
+    };
+  }
+};
+
 // Database configuration
 const dbConfig: PoolConfig = {
   host: config.database.host,
@@ -12,7 +36,7 @@ const dbConfig: PoolConfig = {
   database: config.database.database,
   user: config.database.username,
   password: config.database.password,
-  ssl: config.database.ssl ? { rejectUnauthorized: false } : false,
+  ssl: getSSLConfig(),
   min: config.database.pool.min,
   max: config.database.pool.max,
   idleTimeoutMillis: config.database.pool.idleTimeoutMillis,
@@ -43,6 +67,7 @@ export const connectDatabase = async (): Promise<void> => {
 
     logger.info('✅ Database connected successfully');
     logger.info(`📊 Database: ${config.database.host}:${config.database.port}/${config.database.database}`);
+    logger.info(`🔒 SSL: ${config.database.ssl ? (config.nodeEnv === 'production' ? 'Enabled (Verified)' : 'Enabled (Development)') : 'Disabled'}`);
   } catch (error) {
     if (config.nodeEnv === 'development') {
       logger.warn('⚠️ Database connection failed in development mode - continuing without database');
