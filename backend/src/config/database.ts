@@ -7,8 +7,8 @@ let pool: Pool;
 
 // SSL Configuration function
 const getSSLConfig = () => {
-  // Always disable SSL for EC2 deployment
-  return false;
+  // Use process.env.DB_SSL for SSL configuration
+  return process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false;
 };
 
 // Database configuration
@@ -40,7 +40,14 @@ export const connectDatabase = async (): Promise<void> => {
     dbConfig.database = config.database.database;
 
     // Create connection pool
-    pool = new Pool(dbConfig);
+    pool = new Pool({
+      host: config.database.host,
+      port: config.database.port,
+      database: config.database.database,
+      user: config.database.username,
+      password: config.database.password,
+      ssl: getSSLConfig(),
+    });
 
     // Test connection
     const client = await pool.connect();
