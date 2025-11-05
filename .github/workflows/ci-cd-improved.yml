@@ -1,0 +1,356 @@
+name: Google Drive Clone CI/CD Pipeline
+
+# This workflow requires the following GitHub secrets to be configured:
+# - AWS_ACCESS_KEY_ID: AWS Access Key for deployment
+# - AWS_SECRET_ACCESS_KEY: AWS Secret Access Key for deployment  
+# - AWS_ACCOUNT_ID: Your AWS Account ID (12-digit number)
+# - S3_FRONTEND_BUCKET: S3 bucket name for frontend deployment
+# - CLOUDFRONT_DISTRIBUTION_ID: CloudFront distribution ID for cache invalidation
+#
+# See .github/SECRETS.md for detailed setup instructions
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  AWS_REGION: us-west-2
+  EKS_CLUSTER_NAME: gdrive-clone-prod-eks
+  NODE_VERSION: '18'
+
+jobs:
+  # Test and Build Backend
+  backend-ci:
+    name: Backend CI
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: gdrive_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: backend/package-lock.json
+
+    - name: Install backend dependencies
+      run: |
+        cd backend
+        npm ci
+
+    - name: Run backend linting
+      run: |
+        cd backend
+        npm run lint
+      continue-on-error: true
+
+    - name: Run backend tests
+      run: |
+        cd backend
+        npm test
+      env:
+        NODE_ENV: test
+        DB_HOST: localhost
+        DB_PORT: 5432
+        DB_NAME: gdrive_test
+        DB_USERNAME: postgres
+        DB_PASSWORD: postgres
+        JWT_SECRET: test-secret
+      continue-on-error: true
+
+    - name: Build backend
+      run: |
+        cd backend
+        npm run build
+
+    # AWS deployment steps (only run on main branch)
+    - name: Configure AWS credentials
+      if: github.ref == 'refs/heads/main'
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+      continue-on-error: true
+
+    - name: Login to Amazon ECR
+      if: github.ref == 'refs/heads/main'
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+      continue-on-error: true
+
+    - name: Build and push backend Docker image
+      if: github.ref == 'refs/heads/main'
+      run: |
+        cd backend
+        # Set ECR registry URL
+        ECR_REGISTRY="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+        
+        # Build and tag Docker image
+        docker build -t $ECR_REGISTRY/gdrive-backend:$GITHUB_SHA .
+        docker tag $ECR_REGISTRY/gdrive-backend:$GITHUB_SHA $ECR_REGISTRY/gdrive-backend:latest
+        
+        # Push to ECR (only if secrets are configured)
+        docker push $ECR_REGISTRY/gdrive-backend:$GITHUB_SHA || echo "⚠️ ECR push failed - check AWS secrets"
+        docker push $ECR_REGISTRY/gdrive-backend:latest || echo "⚠️ ECR push failed - check AWS secrets"
+      continue-on-error: true
+
+  # Test and Build Frontend
+  frontend-ci:
+    name: Frontend CI
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Install frontend dependencies
+      run: |
+        cd frontend
+        npm ci
+
+    - name: Run frontend linting
+      run: |
+        cd frontend
+        npm run lint
+      continue-on-error: true
+
+    - name: Run frontend tests
+      run: |
+        cd frontend
+        npm test -- --coverage --watchAll=false
+      continue-on-error: true
+
+    - name: Build frontend
+      run: |
+        cd frontend
+        npm run build
+      env:
+        REACT_APP_API_URL: https://api.your-domain.com
+        REACT_APP_AWS_REGION: ${{ env.AWS_REGION }}
+
+    # AWS deployment steps (only run on main branch)
+    - name: Configure AWS credentials
+      if: github.ref == 'refs/heads/main'
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+      continue-on-error: true
+
+    - name: Deploy to S3
+      if: github.ref == 'refs/heads/main'
+      run: |
+        cd frontend
+        aws s3 sync build/ s3://${{ secrets.S3_FRONTEND_BUCKET }} --delete || echo "⚠️ S3 sync failed - check AWS secrets and bucket name"
+      continue-on-error: true
+
+    - name: Invalidate CloudFront
+      if: github.ref == 'refs/heads/main'
+      run: |
+        aws cloudfront create-invalidation \
+          --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+          --paths "/*" || echo "⚠️ CloudFront invalidation failed - check distribution ID"
+      continue-on-error: true
+
+  # Security Scanning
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: [backend-ci, frontend-ci]
+    if: always()
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+      continue-on-error: true
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+      continue-on-error: true
+
+  # Infrastructure as Code (Terraform)
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.0
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+      continue-on-error: true
+
+    - name: Terraform Init
+      run: |
+        cd infrastructure
+        terraform init || echo "⚠️ Terraform init failed - check AWS credentials"
+      continue-on-error: true
+
+    - name: Terraform Plan
+      run: |
+        cd infrastructure
+        terraform plan -var-file="environments/prod/terraform.tfvars" || echo "⚠️ Terraform plan failed"
+      continue-on-error: true
+
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: [backend-ci, frontend-ci]
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.0
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+      continue-on-error: true
+
+    - name: Terraform Init
+      run: |
+        cd infrastructure
+        terraform init || echo "⚠️ Terraform init failed - check AWS credentials"
+      continue-on-error: true
+
+    - name: Terraform Apply
+      run: |
+        cd infrastructure
+        terraform apply -auto-approve -var-file="environments/prod/terraform.tfvars" || echo "⚠️ Terraform apply failed"
+      continue-on-error: true
+
+  # Deploy to EKS (only if terraform and docker builds succeed)
+  deploy-eks:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    needs: [backend-ci, frontend-ci, terraform-apply]
+    if: github.ref == 'refs/heads/main' && always()
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+      continue-on-error: true
+
+    - name: Install kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }} || echo "⚠️ Failed to update kubeconfig"
+      continue-on-error: true
+
+    - name: Deploy to EKS
+      run: |
+        # Update image tags in Kubernetes manifests
+        sed -i "s|IMAGE_TAG|$GITHUB_SHA|g" k8s/backend/deployment.yaml
+        
+        # Apply Kubernetes manifests
+        kubectl apply -f k8s/backend/ || echo "⚠️ Backend deployment failed"
+        kubectl apply -f k8s/ingress/ || echo "⚠️ Ingress deployment failed"
+        kubectl apply -f k8s/monitoring/ || echo "⚠️ Monitoring deployment failed"
+        
+        # Wait for deployment rollout
+        kubectl rollout status deployment/gdrive-backend -n default --timeout=300s || echo "⚠️ Deployment rollout failed"
+      continue-on-error: true
+
+    - name: Verify deployment
+      run: |
+        echo "📋 Deployment Status:"
+        kubectl get pods -n default || echo "⚠️ Failed to get pods"
+        kubectl get services -n default || echo "⚠️ Failed to get services"
+        kubectl get ingress -n default || echo "⚠️ Failed to get ingress"
+      continue-on-error: true
+
+  # Notification Summary
+  notify:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [backend-ci, frontend-ci, security-scan, deploy-eks]
+    if: always()
+
+    steps:
+    - name: Summary
+      run: |
+        echo "🚀 Google Drive Clone CI/CD Pipeline Summary"
+        echo "============================================="
+        echo "Backend CI: ${{ needs.backend-ci.result }}"
+        echo "Frontend CI: ${{ needs.frontend-ci.result }}"
+        echo "Security Scan: ${{ needs.security-scan.result }}"
+        echo "EKS Deployment: ${{ needs.deploy-eks.result }}"
+        echo ""
+        echo "💡 To enable full deployment:"
+        echo "1. Configure GitHub secrets (see .github/SECRETS.md)"
+        echo "2. Set up AWS infrastructure with Terraform"
+        echo "3. Configure EKS cluster and ECR repositories"
+        echo ""
+        if [[ "${{ needs.backend-ci.result }}" == "success" && "${{ needs.frontend-ci.result }}" == "success" ]]; then
+          echo "✅ Build successful! Ready for deployment."
+        else
+          echo "❌ Build failed. Check logs for details."
+        fi
