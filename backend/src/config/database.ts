@@ -1,64 +1,29 @@
-import { Pool, PoolConfig } from 'pg';
-import { config, initializeSecrets } from './config';
+import { Pool } from 'pg';
 import { logger } from '../utils/logger';
 
 // Database connection pool
-let pool: Pool;
-
-// SSL Configuration function
-const getSSLConfig = () => {
-  // Use process.env.DB_SSL for SSL configuration
-  return process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false;
-};
-
-// Database configuration
-const dbConfig: PoolConfig = {
-  host: config.database.host,
-  port: config.database.port,
-  database: config.database.database,
-  user: config.database.username,
-  password: config.database.password,
-  ssl: getSSLConfig(),
-  min: config.database.pool.min,
-  max: config.database.pool.max,
-  idleTimeoutMillis: config.database.pool.idleTimeoutMillis,
-  connectionTimeoutMillis: 5000,
-  statement_timeout: 30000,
-  query_timeout: 30000,
-};
+export const pool = new Pool({
+  host: process.env.DB_HOST,
+  port: Number(process.env.DB_PORT),
+  database: process.env.DB_NAME,
+  user: process.env.DB_USERNAME,
+  password: process.env.DB_PASSWORD,
+  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false,
+});
 
 // Initialize database connection
 export const connectDatabase = async (): Promise<void> => {
   try {
-    // Initialize secrets first in production
-    await initializeSecrets();
-
-    // Update config with secrets
-    dbConfig.host = config.database.host;
-    dbConfig.user = config.database.username;
-    dbConfig.password = config.database.password;
-    dbConfig.database = config.database.database;
-
-    // Create connection pool
-    pool = new Pool({
-      host: config.database.host,
-      port: config.database.port,
-      database: config.database.database,
-      user: config.database.username,
-      password: config.database.password,
-      ssl: getSSLConfig(),
-    });
-
     // Test connection
     const client = await pool.connect();
     await client.query('SELECT NOW()');
     client.release();
 
     logger.info('✅ Database connected successfully');
-    logger.info(`📊 Database: ${config.database.host}:${config.database.port}/${config.database.database}`);
-    logger.info(`🔒 SSL: ${config.database.ssl ? (config.nodeEnv === 'production' ? 'Enabled (Verified)' : 'Enabled (Development)') : 'Disabled'}`);
+    logger.info(`📊 Database: ${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_NAME}`);
+    logger.info(`🔒 SSL: ${process.env.DB_SSL === 'true' ? 'Enabled' : 'Disabled'}`);
   } catch (error) {
-    if (config.nodeEnv === 'development') {
+    if (process.env.NODE_ENV === 'development') {
       logger.warn('⚠️ Database connection failed in development mode - continuing without database');
       logger.warn('💡 To connect to database, start PostgreSQL or update .env file');
     } else {
@@ -66,14 +31,6 @@ export const connectDatabase = async (): Promise<void> => {
       throw error;
     }
   }
-};
-
-// Get database pool
-export const getPool = (): Pool => {
-  if (!pool) {
-    throw new Error('Database not initialized. Call connectDatabase() first.');
-  }
-  return pool;
 };
 
 // Close database connection
@@ -87,9 +44,6 @@ export const closeDatabase = async (): Promise<void> => {
 // Health check query
 export const healthCheck = async (): Promise<boolean> => {
   try {
-    if (!pool) {
-      return false; // No database connection in development
-    }
     const client = await pool.connect();
     await client.query('SELECT 1');
     client.release();
@@ -134,7 +88,6 @@ export const transaction = async <T>(
 
 export default {
   connectDatabase,
-  getPool,
   closeDatabase,
   healthCheck,
   query,
